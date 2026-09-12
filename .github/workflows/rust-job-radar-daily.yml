@@ -1,4 +1,3 @@
-# Test trigger: 2026-09-12 fixed sender mail
 name: Rust Job Radar - Daily
 
 on:
@@ -42,10 +41,6 @@ jobs:
 
       - name: Run radar
         env:
-          MAIL_TO: ${{ secrets.MAIL_TO }}
-          SMTP_USERNAME: aliihaydargenc@gmail.com
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          SMTP_HOST: smtp.gmail.com
           JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
         run: cargo run --release
 
