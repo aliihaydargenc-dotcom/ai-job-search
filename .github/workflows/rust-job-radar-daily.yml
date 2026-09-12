@@ -23,6 +23,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Restore 30-day job cache
+        uses: actions/cache/restore@v4
+        with:
+          path: rust-job-radar/data/job_cache.json
+          key: rust-job-radar-job-cache-${{ github.run_id }}
+          restore-keys: |
+            rust-job-radar-job-cache-
+
       - name: Prepare report directory
         run: mkdir -p data
 
@@ -43,3 +51,10 @@ jobs:
           path: rust-job-radar/data/latest_report.html
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Save 30-day job cache
+        if: ${{ always() && hashFiles('rust-job-radar/data/job_cache.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: rust-job-radar/data/job_cache.json
+          key: rust-job-radar-job-cache-${{ github.run_id }}
