@@ -2,6 +2,8 @@
   "location": "Antalya",
   "radius": "0",
   "result_on_page": 100,
+  "max_api_pages": 2,
+  "bootstrap_api_pages": 3,
   "jooble_queries": [
     "iş",
     "personel",
