@@ -6,14 +6,15 @@ use lettre::{
     Message, SmtpTransport, Transport,
 };
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{env, fs, path::Path, time::Duration};
+use std::{collections::HashMap, env, fs, path::Path, time::Duration};
 
 const SETTINGS_PATH: &str = "settings.json";
 const REPORT_PATH: &str = "data/latest_report.html";
+const CACHE_PATH: &str = "data/job_cache.json";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Job {
     source: String,
     source_id: Option<String>,
@@ -34,6 +35,10 @@ struct Settings {
     radius: String,
     #[serde(default = "default_result_on_page")]
     result_on_page: usize,
+    #[serde(default = "default_max_api_pages")]
+    max_api_pages: usize,
+    #[serde(default = "default_bootstrap_api_pages")]
+    bootstrap_api_pages: usize,
 }
 
 fn default_location() -> String {
@@ -46,6 +51,14 @@ fn default_radius() -> String {
 
 fn default_result_on_page() -> usize {
     100
+}
+
+fn default_max_api_pages() -> usize {
+    2
+}
+
+fn default_bootstrap_api_pages() -> usize {
+    3
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,17 +85,25 @@ fn main() -> Result<()> {
     let settings = load_settings()?;
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent("AliJobRadar/0.4")
+        .user_agent("AliJobRadar/0.5")
         .build()
         .context("HTTP istemcisi oluşturulamadı")?;
 
     let (window_start, window_end) = last_30_days_istanbul();
     let mut warnings = Vec::new();
+    let cached_jobs = load_cache()?;
+    let cache_was_empty = cached_jobs.is_empty();
 
     let api_key = env::var("JOOBLE_API_KEY").unwrap_or_default();
-    let mut jobs = if api_key.trim().is_empty() {
+    let page_limit = if cache_was_empty {
+        settings.bootstrap_api_pages.max(1)
+    } else {
+        settings.max_api_pages.max(1)
+    };
+
+    let (fresh_jobs, api_calls) = if api_key.trim().is_empty() {
         warnings.push("JOOBLE_API_KEY tanımlı değil".to_string());
-        Vec::new()
+        (Vec::new(), 0usize)
     } else {
         match fetch_jooble(
             &client,
@@ -90,27 +111,39 @@ fn main() -> Result<()> {
             &settings,
             &window_start,
             &window_end,
+            page_limit,
         ) {
             Ok(found) => found,
             Err(err) => {
                 warnings.push(format!("Jooble: {err:#}"));
-                Vec::new()
+                (Vec::new(), 0usize)
             }
         }
     };
 
-    jobs = deduplicate(jobs);
+    let fresh_count = fresh_jobs.len();
+    let mut jobs = merge_cache(cached_jobs, fresh_jobs, &window_start, &window_end);
     jobs.sort_by(|a, b| {
         b.updated
             .cmp(&a.updated)
             .then_with(|| a.title.cmp(&b.title))
     });
+    save_cache(&jobs)?;
 
     let subject = format!(
         "Antalya İş İlanları — Son 30 Gün — {} ilan",
         jobs.len()
     );
-    let html = build_email_html(&jobs, &window_start, &window_end, &warnings, &settings);
+    let html = build_email_html(
+        &jobs,
+        &window_start,
+        &window_end,
+        &warnings,
+        &settings,
+        fresh_count,
+        api_calls,
+        cache_was_empty,
+    );
     save_report(&html)?;
 
     let mail_ready = ["MAIL_TO", "SMTP_USERNAME", "SMTP_PASSWORD"]
@@ -125,11 +158,13 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "Tamamlandı. Dönem: {} - {}, konum: {}, ilan: {}, kaynak uyarısı: {}",
+        "Tamamlandı. Dönem: {} - {}, konum: {}, cache ilanı: {}, bu çalışmada API'den gelen: {}, API çağrısı: {}, kaynak uyarısı: {}",
         window_start,
         window_end,
         settings.location,
         jobs.len(),
+        fresh_count,
+        api_calls,
         warnings.len()
     );
     Ok(())
@@ -139,6 +174,25 @@ fn load_settings() -> Result<Settings> {
     let raw = fs::read_to_string(SETTINGS_PATH)
         .with_context(|| format!("{} okunamadı", SETTINGS_PATH))?;
     serde_json::from_str(&raw).context("settings.json geçerli JSON değil")
+}
+
+fn load_cache() -> Result<Vec<Job>> {
+    if !Path::new(CACHE_PATH).exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(CACHE_PATH).context("İlan cache dosyası okunamadı")?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&raw).context("İlan cache dosyası geçerli JSON değil")
+}
+
+fn save_cache(jobs: &[Job]) -> Result<()> {
+    if let Some(parent) = Path::new(CACHE_PATH).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let raw = serde_json::to_string_pretty(jobs).context("İlan cache JSON üretilemedi")?;
+    fs::write(CACHE_PATH, raw).context("İlan cache dosyası kaydedilemedi")
 }
 
 fn last_30_days_istanbul() -> (String, String) {
@@ -169,7 +223,8 @@ fn fetch_jooble(
     settings: &Settings,
     start_date: &str,
     end_date: &str,
-) -> Result<Vec<Job>> {
+    page_limit: usize,
+) -> Result<(Vec<Job>, usize)> {
     let endpoint = format!("https://tr.jooble.org/api/{api_key}");
     let query = settings.jooble_queries.join(", ");
     if query.trim().is_empty() {
@@ -178,9 +233,12 @@ fn fetch_jooble(
 
     let mut result = Vec::new();
     let mut page = 1usize;
+    let mut api_calls = 0usize;
     let per_page = settings.result_on_page.clamp(1, 100);
+    let page_limit = page_limit.clamp(1, 10);
 
     loop {
+        api_calls += 1;
         let response: JoobleResponse = client
             .post(&endpoint)
             .json(&json!({
@@ -226,13 +284,16 @@ fn fetch_jooble(
             });
         }
 
-        if received == 0 || page * per_page >= total_count || page >= 10 {
+        if received == 0
+            || page * per_page >= total_count
+            || page >= page_limit
+        {
             break;
         }
         page += 1;
     }
 
-    Ok(result)
+    Ok((deduplicate(result), api_calls))
 }
 
 fn in_iso_day_range(value: &str, start_date: &str, end_date: &str) -> bool {
@@ -255,20 +316,50 @@ fn json_id_to_string(value: Value) -> String {
     }
 }
 
+fn job_key(job: &Job) -> String {
+    if let Some(id) = &job.source_id {
+        format!("{}:{}", normalize(&job.source), id)
+    } else {
+        normalize_url(&job.url)
+    }
+}
+
 fn deduplicate(jobs: Vec<Job>) -> Vec<Job> {
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
+    let mut by_key: HashMap<String, Job> = HashMap::new();
     for job in jobs {
-        let key = if let Some(id) = &job.source_id {
-            format!("{}:{}", normalize(&job.source), id)
-        } else {
-            normalize_url(&job.url)
-        };
-        if seen.insert(key) {
-            result.push(job);
+        let key = job_key(&job);
+        match by_key.get(&key) {
+            Some(existing) if existing.updated >= job.updated => {}
+            _ => {
+                by_key.insert(key, job);
+            }
         }
     }
-    result
+    by_key.into_values().collect()
+}
+
+fn merge_cache(
+    cached: Vec<Job>,
+    fresh: Vec<Job>,
+    start_date: &str,
+    end_date: &str,
+) -> Vec<Job> {
+    let mut by_key: HashMap<String, Job> = HashMap::new();
+
+    for job in cached.into_iter().chain(fresh) {
+        if !is_antalya(&job.location) || !in_iso_day_range(&job.updated, start_date, end_date) {
+            continue;
+        }
+        let key = job_key(&job);
+        match by_key.get(&key) {
+            Some(existing) if existing.updated >= job.updated => {}
+            _ => {
+                by_key.insert(key, job);
+            }
+        }
+    }
+
+    by_key.into_values().collect()
 }
 
 fn save_report(html: &str) -> Result<()> {
@@ -284,6 +375,9 @@ fn build_email_html(
     end_date: &str,
     warnings: &[String],
     settings: &Settings,
+    fresh_count: usize,
+    api_calls: usize,
+    cache_was_empty: bool,
 ) -> String {
     let mut rows = String::new();
 
@@ -319,11 +413,27 @@ fn build_email_html(
         )
     };
 
+    let quota_note = if cache_was_empty {
+        format!(
+            "İlk cache kurulumu: en fazla {} API sayfası. Sonraki günlük çalışmalarda en fazla {} sayfa kullanılacak.",
+            settings.bootstrap_api_pages.max(1),
+            settings.max_api_pages.max(1)
+        )
+    } else {
+        format!(
+            "API kota koruması aktif: bu çalışmada {} çağrı yapıldı; günlük üst sınır {} sayfa. 30 günlük geçmiş ilanlar yerel cache'de korunur.",
+            api_calls,
+            settings.max_api_pages.max(1)
+        )
+    };
+
     format!(
         "<!doctype html><html lang='tr'><body style='font-family:Arial,sans-serif;max-width:980px;margin:auto;padding:24px;color:#222'>\
          <h2>Antalya İş İlanları — Son 30 Gün</h2>\
          <p><b>Dönem:</b> {} - {} &nbsp; <b>Konum:</b> {} &nbsp; <b>Toplam:</b> {}</p>\
-         <p>Rol veya uygunluk puanı nedeniyle ilan elenmez. Jooble API anahtar kelime alanını zorunlu tuttuğu için geniş bir kelime kümesiyle tarama yapılır; bu nedenle rapor Jooble'daki tüm Antalya ilanlarının eksiksiz kopyası olduğunu iddia etmez.</p>\
+         <p><b>Bu çalışmada API'den alınan:</b> {} &nbsp; <b>API çağrısı:</b> {}</p>\
+         <p>{}</p>\
+         <p>Rol veya uygunluk puanı nedeniyle ilan elenmez. Jooble API anahtar kelime alanını zorunlu tuttuğu için geniş bir kelime kümesiyle tarama yapılır; cache önceki günlerde görülen ilanları 30 günlük pencere boyunca korur.</p>\
          <table style='width:100%;border-collapse:collapse;font-size:13px'>\
          <thead><tr style='text-align:left;background:#f5f5f5'>\
          <th style='padding:8px'>Pozisyon</th><th style='padding:8px'>Şirket</th><th style='padding:8px'>Konum</th><th style='padding:8px'>Kaynak</th><th style='padding:8px'>Güncelleme</th><th style='padding:8px'>Link</th>\
@@ -331,7 +441,10 @@ fn build_email_html(
         format_date_tr(start_date),
         format_date_tr(end_date),
         escape_html(&settings.location),
-        jobs.len()
+        jobs.len(),
+        fresh_count,
+        api_calls,
+        escape_html(&quota_note)
     )
 }
 
