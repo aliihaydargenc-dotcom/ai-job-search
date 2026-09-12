@@ -147,7 +147,6 @@ fn load_settings() -> Result<Settings> {
 }
 
 fn yesterday_istanbul() -> String {
-    // Türkiye 2016'dan beri yıl boyunca UTC+3 kullanıyor.
     let istanbul_now = Utc::now() + ChronoDuration::hours(3);
     (istanbul_now.date_naive() - ChronoDuration::days(1))
         .format("%Y-%m-%d")
@@ -261,7 +260,7 @@ fn score_job(job: &Job, settings: &Settings) -> (i32, Vec<String>) {
     let title = normalize(&job.title);
     let description = normalize(&job.description);
     let all = format!("{title} {description}");
-    let mut score = 22i32; // Antalya sabit konum puanı
+    let mut score = 22i32;
     let mut reasons = vec!["Antalya".to_string()];
 
     if let Some(role) = settings.roles.iter().find(|r| title.contains(&normalize(r))) {
@@ -364,14 +363,27 @@ fn build_email_html(
 }
 
 fn send_email(subject: &str, html: &str) -> Result<()> {
-    let to = env::var("MAIL_TO").context("MAIL_TO yok")?;
+    let recipients_raw = env::var("MAIL_TO").context("MAIL_TO yok")?;
     let username = env::var("SMTP_USERNAME").context("SMTP_USERNAME yok")?;
     let password = env::var("SMTP_PASSWORD").context("SMTP_PASSWORD yok")?;
     let host = env::var("SMTP_HOST").unwrap_or_else(|_| "smtp.gmail.com".into());
 
-    let email = Message::builder()
-        .from(username.parse()?)
-        .to(to.parse()?)
+    let recipients: Vec<&str> = recipients_raw
+        .split(|c| c == ',' || c == ';')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    if recipients.is_empty() {
+        anyhow::bail!("MAIL_TO içinde geçerli alıcı yok");
+    }
+
+    let mut builder = Message::builder().from(username.parse()?);
+    for recipient in recipients {
+        builder = builder.to(recipient.parse()?);
+    }
+
+    let email = builder
         .subject(subject)
         .header(ContentType::TEXT_HTML)
         .body(html.to_string())?;
