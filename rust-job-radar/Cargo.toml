@@ -1,0 +1,16 @@
+[package]
+name = "ali-job-radar"
+version = "0.1.0"
+edition = "2021"
+description = "Daily job radar: fetch, score, deduplicate and email matching jobs."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+dotenvy = "0.15"
+lettre = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
