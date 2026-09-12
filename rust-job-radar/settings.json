@@ -1,0 +1,52 @@
+{
+  "min_score": 48,
+  "max_email_jobs": 15,
+  "roles": [
+    "data analyst",
+    "veri analisti",
+    "bi analyst",
+    "business intelligence",
+    "reporting analyst",
+    "reporting specialist",
+    "raporlama uzmanı",
+    "sql analyst",
+    "data reporting",
+    "revenue analyst"
+  ],
+  "skills": [
+    "sql",
+    "excel",
+    "qlik",
+    "qlik sense",
+    "power bi",
+    "python",
+    "reporting",
+    "dashboard",
+    "data analysis",
+    "veri analizi"
+  ],
+  "locations": [
+    "antalya",
+    "türkiye",
+    "turkey",
+    "remote",
+    "hybrid",
+    "worldwide",
+    "anywhere",
+    "europe",
+    "emea"
+  ],
+  "penalty_terms": [
+    "senior",
+    "lead",
+    "principal",
+    "director",
+    "head of",
+    "manager"
+  ],
+  "jooble_queries": [
+    "data analyst",
+    "business intelligence",
+    "reporting analyst"
+  ]
+}
