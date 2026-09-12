@@ -5,6 +5,7 @@ on:
   push:
     branches: [master]
     paths:
+      - "rust-job-radar/**"
       - ".github/workflows/rust-job-radar-daily.yml"
   schedule:
     - cron: "15 9 * * *"
@@ -57,7 +58,7 @@ jobs:
           retention-days: 14
 
       - name: Save seen-job state
-        if: always()
+        if: ${{ always() && hashFiles('rust-job-radar/data/seen_jobs.json') != '' }}
         uses: actions/cache/save@v4
         with:
           path: rust-job-radar/data/seen_jobs.json
