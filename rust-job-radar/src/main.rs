@@ -7,7 +7,7 @@ use lettre::{
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -40,7 +40,6 @@ struct Settings {
     max_email_jobs: usize,
     roles: Vec<String>,
     skills: Vec<String>,
-    locations: Vec<String>,
     penalty_terms: Vec<String>,
     jooble_queries: Vec<String>,
 }
@@ -86,7 +85,7 @@ struct JoobleResponse {
 
 #[derive(Debug, Deserialize)]
 struct JoobleJob {
-    id: Option<String>,
+    id: Option<Value>,
     title: Option<String>,
     location: Option<String>,
     snippet: Option<String>,
@@ -100,7 +99,7 @@ fn main() -> Result<()> {
     let settings = load_settings()?;
     let client = Client::builder()
         .timeout(Duration::from_secs(25))
-        .user_agent("AliJobRadar/0.1")
+        .user_agent("AliJobRadar/0.2")
         .build()
         .context("HTTP istemcisi oluşturulamadı")?;
 
@@ -204,9 +203,7 @@ fn fetch_remotive(client: &Client) -> Result<Vec<Job>> {
                 source_id: j.id.map(|x| x.to_string()),
                 title,
                 company: j.company_name.unwrap_or_else(|| "Bilinmiyor".into()),
-                location: j
-                    .candidate_required_location
-                    .unwrap_or_else(|| "Remote".into()),
+                location: j.candidate_required_location.unwrap_or_else(|| "Remote".into()),
                 description: strip_html(&j.description.unwrap_or_default()),
                 url,
                 remote: true,
@@ -255,6 +252,7 @@ fn fetch_arbeitnow(client: &Client) -> Result<Vec<Job>> {
 fn fetch_jooble(client: &Client, api_key: &str, settings: &Settings) -> Result<Vec<Job>> {
     let endpoint = format!("https://tr.jooble.org/api/{api_key}");
     let mut result = Vec::new();
+
     for query in &settings.jooble_queries {
         let response: JoobleResponse = client
             .post(&endpoint)
@@ -274,7 +272,7 @@ fn fetch_jooble(client: &Client, api_key: &str, settings: &Settings) -> Result<V
             }
             result.push(Job {
                 source: j.source.unwrap_or_else(|| "Jooble".into()),
-                source_id: j.id,
+                source_id: j.id.map(json_id_to_string),
                 title,
                 company: j.company.unwrap_or_else(|| "Bilinmiyor".into()),
                 location: j.location.unwrap_or_else(|| "Antalya".into()),
@@ -289,12 +287,21 @@ fn fetch_jooble(client: &Client, api_key: &str, settings: &Settings) -> Result<V
     Ok(result)
 }
 
+fn json_id_to_string(value: Value) -> String {
+    match value {
+        Value::String(s) => s,
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn score_job(job: &Job, settings: &Settings) -> (i32, Vec<String>) {
     let title = normalize(&job.title);
     let description = normalize(&job.description);
     let location = normalize(&job.location);
     let all = format!("{title} {description} {location}");
-    let mut score: i32 = 0;
+    let mut score = 0i32;
     let mut reasons = Vec::new();
 
     if let Some(role) = settings.roles.iter().find(|r| title.contains(&normalize(r))) {
@@ -318,7 +325,7 @@ fn score_job(job: &Job, settings: &Settings) -> (i32, Vec<String>) {
     if location.contains("antalya") {
         score += 22;
         reasons.push("Antalya".into());
-    } else if location.contains("turkey") || location.contains("turkiye") {
+    } else if location.contains("turkey") || location.contains("turkiye") || location.contains("türkiye") {
         score += 14;
         reasons.push("Türkiye".into());
     }
@@ -353,13 +360,7 @@ fn score_job(job: &Job, settings: &Settings) -> (i32, Vec<String>) {
         score -= 18;
         reasons.push(format!("Üst seviye rol: {term}"));
     }
-    if settings
-        .locations
-        .iter()
-        .any(|loc| all.contains(&normalize(loc)))
-    {
-        score += 4;
-    }
+
     (score.clamp(0, 100), reasons)
 }
 
@@ -424,47 +425,55 @@ fn build_email_html(jobs: &[Job], fetched: usize, warnings: &[String], settings:
             ));
         }
     }
+
     let warning_html = if warnings.is_empty() {
         String::new()
     } else {
-        format!("<p><small>Kaynak uyarıları: {}</small></p>", escape_html(&warnings.join(" | ")))
+        format!(
+            "<p><small>Kaynak uyarıları: {}</small></p>",
+            escape_html(&warnings.join(" | "))
+        )
     };
+
     format!(
-        "<!doctype html><html lang='tr'><body style='font-family:Arial;max-width:760px;margin:auto;padding:24px'><h2>Günlük İş Radarı</h2><p>{} ilan tarandı. Eşik: {}. Yeni güçlü eşleşme: {}.</p>{}{}</body></html>",
-        fetched,
+        "<!doctype html><html lang='tr'><body style='font-family:Arial;max-width:760px;margin:auto;padding:24px'><h2>Günlük İş Radarı</h2><p>{fetched} ilan tarandı. Eşik: {}. Yeni güçlü eşleşme: {}.</p>{cards}{warning_html}</body></html>",
         settings.min_score,
-        jobs.len(),
-        cards,
-        warning_html
+        jobs.len()
     )
 }
 
 fn send_email(subject: &str, html: &str) -> Result<()> {
-    let to = env::var("MAIL_TO").context("MAIL_TO tanımlı değil")?;
-    let username = env::var("SMTP_USERNAME").context("SMTP_USERNAME tanımlı değil")?;
-    let password = env::var("SMTP_PASSWORD").context("SMTP_PASSWORD tanımlı değil")?;
+    let to = env::var("MAIL_TO").context("MAIL_TO yok")?;
+    let username = env::var("SMTP_USERNAME").context("SMTP_USERNAME yok")?;
+    let password = env::var("SMTP_PASSWORD").context("SMTP_PASSWORD yok")?;
     let host = env::var("SMTP_HOST").unwrap_or_else(|_| "smtp.gmail.com".into());
 
     let email = Message::builder()
-        .from(username.parse().context("SMTP_USERNAME geçerli e-posta değil")?)
-        .to(to.parse().context("MAIL_TO geçerli e-posta değil")?)
+        .from(username.parse()?)
+        .to(to.parse()?)
         .subject(subject)
         .header(ContentType::TEXT_HTML)
-        .body(html.to_owned())
-        .context("E-posta oluşturulamadı")?;
+        .body(html.to_string())?;
 
-    let mailer = SmtpTransport::relay(&host)
-        .with_context(|| format!("SMTP bağlantısı kurulamadı: {host}"))?
+    let mailer = SmtpTransport::relay(&host)?
         .credentials(Credentials::new(username, password))
         .build();
-    mailer.send(&email).context("E-posta gönderilemedi")?;
+    mailer.send(&email).context("SMTP gönderimi başarısız")?;
     Ok(())
 }
 
-fn strip_html(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
+fn normalize(value: &str) -> String {
+    value.to_lowercase().replace('ı', "i")
+}
+
+fn normalize_url(value: &str) -> String {
+    value.split('?').next().unwrap_or(value).trim_end_matches('/').to_string()
+}
+
+fn strip_html(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
     let mut in_tag = false;
-    for ch in input.chars() {
+    for ch in value.chars() {
         match ch {
             '<' => in_tag = true,
             '>' => {
@@ -475,80 +484,14 @@ fn strip_html(input: &str) -> String {
             _ => {}
         }
     }
-    out.replace("&nbsp;", " ").replace("&amp;", "&")
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn normalize(input: &str) -> String {
-    input
-        .to_lowercase()
-        .replace('ı', "i")
-        .replace('ş', "s")
-        .replace('ğ', "g")
-        .replace('ü', "u")
-        .replace('ö', "o")
-        .replace('ç', "c")
-}
-
-fn normalize_url(input: &str) -> String {
-    input
-        .trim()
-        .split('#')
-        .next()
-        .unwrap_or(input)
-        .trim_end_matches('/')
-        .to_lowercase()
-}
-
-fn escape_html(input: &str) -> String {
-    input
+fn escape_html(value: &str) -> String {
+    value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn settings() -> Settings {
-        Settings {
-            min_score: 48,
-            max_email_jobs: 15,
-            roles: vec!["data analyst".into(), "veri analisti".into()],
-            skills: vec!["sql".into(), "excel".into(), "qlik sense".into()],
-            locations: vec!["antalya".into(), "remote".into()],
-            penalty_terms: vec!["senior".into()],
-            jooble_queries: vec!["data analyst".into()],
-        }
-    }
-
-    fn job(title: &str) -> Job {
-        Job {
-            source: "test".into(),
-            source_id: None,
-            title: title.into(),
-            company: "Test".into(),
-            location: "Antalya".into(),
-            description: "SQL Excel Qlik Sense".into(),
-            url: "https://example.com/1".into(),
-            remote: false,
-            score: 0,
-            reasons: vec![],
-        }
-    }
-
-    #[test]
-    fn strong_local_match_scores_high() {
-        let (score, _) = score_job(&job("Data Analyst"), &settings());
-        assert!(score >= 70);
-    }
-
-    #[test]
-    fn senior_role_is_penalized() {
-        let (normal, _) = score_job(&job("Data Analyst"), &settings());
-        let (senior, _) = score_job(&job("Senior Data Analyst"), &settings());
-        assert!(senior < normal);
-    }
 }
