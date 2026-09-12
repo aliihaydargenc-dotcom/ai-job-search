@@ -1,0 +1,60 @@
+name: Rust Job Radar - Daily
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 9 * * *"
+      timezone: "Europe/Istanbul"
+
+permissions:
+  contents: read
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-job-radar
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore seen-job state
+        uses: actions/cache/restore@v4
+        with:
+          path: rust-job-radar/data/seen_jobs.json
+          key: rust-job-radar-state-${{ github.run_id }}
+          restore-keys: |
+            rust-job-radar-state-
+
+      - name: Prepare state directory
+        run: mkdir -p data
+
+      - name: Run radar
+        env:
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_HOST: smtp.gmail.com
+          JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
+        run: cargo run --release
+
+      - name: Upload daily report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-job-radar-report
+          path: rust-job-radar/data/latest_report.html
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Save seen-job state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: rust-job-radar/data/seen_jobs.json
+          key: rust-job-radar-state-${{ github.run_id }}
