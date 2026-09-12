@@ -6,35 +6,26 @@ use lettre::{
     Message, SmtpTransport, Transport,
 };
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{env, fs, path::Path, time::Duration};
 
 const SETTINGS_PATH: &str = "settings.json";
 const REPORT_PATH: &str = "data/latest_report.html";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct Job {
     source: String,
     source_id: Option<String>,
     title: String,
     company: String,
     location: String,
-    description: String,
     url: String,
     updated: String,
-    score: i32,
-    reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Settings {
-    #[serde(default)]
-    roles: Vec<String>,
-    #[serde(default)]
-    skills: Vec<String>,
-    #[serde(default)]
-    penalty_terms: Vec<String>,
     #[serde(default)]
     jooble_queries: Vec<String>,
     #[serde(default = "default_location")]
@@ -70,7 +61,6 @@ struct JoobleJob {
     id: Option<Value>,
     title: Option<String>,
     location: Option<String>,
-    snippet: Option<String>,
     source: Option<String>,
     link: Option<String>,
     company: Option<String>,
@@ -82,11 +72,11 @@ fn main() -> Result<()> {
     let settings = load_settings()?;
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent("AliJobRadar/0.3")
+        .user_agent("AliJobRadar/0.4")
         .build()
         .context("HTTP istemcisi oluşturulamadı")?;
 
-    let yesterday = yesterday_istanbul();
+    let (window_start, window_end) = last_30_days_istanbul();
     let mut warnings = Vec::new();
 
     let api_key = env::var("JOOBLE_API_KEY").unwrap_or_default();
@@ -94,7 +84,13 @@ fn main() -> Result<()> {
         warnings.push("JOOBLE_API_KEY tanımlı değil".to_string());
         Vec::new()
     } else {
-        match fetch_jooble(&client, api_key.trim(), &settings, &yesterday) {
+        match fetch_jooble(
+            &client,
+            api_key.trim(),
+            &settings,
+            &window_start,
+            &window_end,
+        ) {
             Ok(found) => found,
             Err(err) => {
                 warnings.push(format!("Jooble: {err:#}"));
@@ -104,19 +100,17 @@ fn main() -> Result<()> {
     };
 
     jobs = deduplicate(jobs);
-    for job in &mut jobs {
-        let (score, reasons) = score_job(job, &settings);
-        job.score = score;
-        job.reasons = reasons;
-    }
-    jobs.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
+    jobs.sort_by(|a, b| {
+        b.updated
+            .cmp(&a.updated)
+            .then_with(|| a.title.cmp(&b.title))
+    });
 
     let subject = format!(
-        "Antalya İş Radarı — {} — {} ilan",
-        format_date_tr(&yesterday),
+        "Antalya İş İlanları — Son 30 Gün — {} ilan",
         jobs.len()
     );
-    let html = build_email_html(&jobs, &yesterday, &warnings, &settings);
+    let html = build_email_html(&jobs, &window_start, &window_end, &warnings, &settings);
     save_report(&html)?;
 
     let mail_ready = ["MAIL_TO", "SMTP_USERNAME", "SMTP_PASSWORD"]
@@ -131,8 +125,9 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "Tamamlandı. Tarih: {}, konum: {}, dün tarihli ilan: {}, kaynak uyarısı: {}",
-        yesterday,
+        "Tamamlandı. Dönem: {} - {}, konum: {}, ilan: {}, kaynak uyarısı: {}",
+        window_start,
+        window_end,
         settings.location,
         jobs.len(),
         warnings.len()
@@ -146,11 +141,14 @@ fn load_settings() -> Result<Settings> {
     serde_json::from_str(&raw).context("settings.json geçerli JSON değil")
 }
 
-fn yesterday_istanbul() -> String {
+fn last_30_days_istanbul() -> (String, String) {
     let istanbul_now = Utc::now() + ChronoDuration::hours(3);
-    (istanbul_now.date_naive() - ChronoDuration::days(1))
-        .format("%Y-%m-%d")
-        .to_string()
+    let today = istanbul_now.date_naive();
+    let start = today - ChronoDuration::days(29);
+    (
+        start.format("%Y-%m-%d").to_string(),
+        today.format("%Y-%m-%d").to_string(),
+    )
 }
 
 fn format_date_tr(iso_date: &str) -> String {
@@ -169,7 +167,8 @@ fn fetch_jooble(
     client: &Client,
     api_key: &str,
     settings: &Settings,
-    target_date: &str,
+    start_date: &str,
+    end_date: &str,
 ) -> Result<Vec<Job>> {
     let endpoint = format!("https://tr.jooble.org/api/{api_key}");
     let query = settings.jooble_queries.join(", ");
@@ -212,7 +211,7 @@ fn fetch_jooble(
                 continue;
             }
 
-            if !is_antalya(&location) || !same_iso_day(&updated, target_date) {
+            if !is_antalya(&location) || !in_iso_day_range(&updated, start_date, end_date) {
                 continue;
             }
 
@@ -222,11 +221,8 @@ fn fetch_jooble(
                 title,
                 company: j.company.unwrap_or_else(|| "Bilinmiyor".into()),
                 location,
-                description: strip_html(&j.snippet.unwrap_or_default()),
                 url,
                 updated,
-                score: 0,
-                reasons: vec![],
             });
         }
 
@@ -239,8 +235,11 @@ fn fetch_jooble(
     Ok(result)
 }
 
-fn same_iso_day(value: &str, target_date: &str) -> bool {
-    value.get(0..10).map(|d| d == target_date).unwrap_or(false)
+fn in_iso_day_range(value: &str, start_date: &str, end_date: &str) -> bool {
+    value
+        .get(0..10)
+        .map(|date| date >= start_date && date <= end_date)
+        .unwrap_or(false)
 }
 
 fn is_antalya(value: &str) -> bool {
@@ -256,48 +255,15 @@ fn json_id_to_string(value: Value) -> String {
     }
 }
 
-fn score_job(job: &Job, settings: &Settings) -> (i32, Vec<String>) {
-    let title = normalize(&job.title);
-    let description = normalize(&job.description);
-    let all = format!("{title} {description}");
-    let mut score = 22i32;
-    let mut reasons = vec!["Antalya".to_string()];
-
-    if let Some(role) = settings.roles.iter().find(|r| title.contains(&normalize(r))) {
-        score += 38;
-        reasons.push(format!("Pozisyon: {role}"));
-    } else if settings.roles.iter().any(|r| all.contains(&normalize(r))) {
-        score += 16;
-        reasons.push("İlan içeriğinde hedef rol".into());
-    }
-
-    let skill_hits = settings
-        .skills
-        .iter()
-        .filter(|s| all.contains(&normalize(s)))
-        .count() as i32;
-    if skill_hits > 0 {
-        score += (skill_hits * 5).min(30);
-        reasons.push(format!("{skill_hits} yetkinlik eşleşmesi"));
-    }
-
-    if let Some(term) = settings
-        .penalty_terms
-        .iter()
-        .find(|term| title.contains(&normalize(term)))
-    {
-        score -= 18;
-        reasons.push(format!("Üst seviye rol: {term}"));
-    }
-
-    (score.clamp(0, 100), reasons)
-}
-
 fn deduplicate(jobs: Vec<Job>) -> Vec<Job> {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     for job in jobs {
-        let key = normalize_url(&job.url);
+        let key = if let Some(id) = &job.source_id {
+            format!("{}:{}", normalize(&job.source), id)
+        } else {
+            normalize_url(&job.url)
+        };
         if seen.insert(key) {
             result.push(job);
         }
@@ -314,28 +280,31 @@ fn save_report(html: &str) -> Result<()> {
 
 fn build_email_html(
     jobs: &[Job],
-    target_date: &str,
+    start_date: &str,
+    end_date: &str,
     warnings: &[String],
     settings: &Settings,
 ) -> String {
-    let mut cards = String::new();
+    let mut rows = String::new();
+
     if jobs.is_empty() {
-        cards.push_str("<p>Bu tarihte hedef roller için Antalya ilanı bulunamadı.</p>");
+        rows.push_str("<tr><td colspan='6' style='padding:14px'>İlan bulunamadı.</td></tr>");
     } else {
         for job in jobs {
-            cards.push_str(&format!(
-                "<div style='padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:12px'>\
-                 <b>{}% — {}</b><br>\
-                 {} — {}<br>\
-                 <small>{} • Güncelleme: {} • {}</small><br>\
-                 <a href='{}'>İlanı aç</a></div>",
-                job.score,
+            rows.push_str(&format!(
+                "<tr>\
+                 <td style='padding:8px;border-bottom:1px solid #eee'>{}</td>\
+                 <td style='padding:8px;border-bottom:1px solid #eee'>{}</td>\
+                 <td style='padding:8px;border-bottom:1px solid #eee'>{}</td>\
+                 <td style='padding:8px;border-bottom:1px solid #eee'>{}</td>\
+                 <td style='padding:8px;border-bottom:1px solid #eee'>{}</td>\
+                 <td style='padding:8px;border-bottom:1px solid #eee'><a href='{}'>Aç</a></td>\
+                 </tr>",
                 escape_html(&job.title),
                 escape_html(&job.company),
                 escape_html(&job.location),
                 escape_html(&job.source),
-                escape_html(&job.updated),
-                escape_html(&job.reasons.join(" • ")),
+                escape_html(job.updated.get(0..10).unwrap_or(&job.updated)),
                 escape_html(&job.url)
             ));
         }
@@ -351,12 +320,16 @@ fn build_email_html(
     };
 
     format!(
-        "<!doctype html><html lang='tr'><body style='font-family:Arial;max-width:780px;margin:auto;padding:24px'>\
-         <h2>Antalya Günlük İş Radarı</h2>\
-         <p><b>Tarih:</b> {} &nbsp; <b>Konum:</b> {} &nbsp; <b>İlan:</b> {}</p>\
-         <p>Bu raporda puan eşiği uygulanmaz; dün tarihli tüm hedef ilanlar gösterilir. Puan yalnızca uygunluk sıralamasıdır.</p>\
-         {cards}{warning_html}</body></html>",
-        format_date_tr(target_date),
+        "<!doctype html><html lang='tr'><body style='font-family:Arial,sans-serif;max-width:980px;margin:auto;padding:24px;color:#222'>\
+         <h2>Antalya İş İlanları — Son 30 Gün</h2>\
+         <p><b>Dönem:</b> {} - {} &nbsp; <b>Konum:</b> {} &nbsp; <b>Toplam:</b> {}</p>\
+         <p>Rol veya uygunluk puanı nedeniyle ilan elenmez. Jooble API anahtar kelime alanını zorunlu tuttuğu için geniş bir kelime kümesiyle tarama yapılır; bu nedenle rapor Jooble'daki tüm Antalya ilanlarının eksiksiz kopyası olduğunu iddia etmez.</p>\
+         <table style='width:100%;border-collapse:collapse;font-size:13px'>\
+         <thead><tr style='text-align:left;background:#f5f5f5'>\
+         <th style='padding:8px'>Pozisyon</th><th style='padding:8px'>Şirket</th><th style='padding:8px'>Konum</th><th style='padding:8px'>Kaynak</th><th style='padding:8px'>Güncelleme</th><th style='padding:8px'>Link</th>\
+         </tr></thead><tbody>{rows}</tbody></table>{warning_html}</body></html>",
+        format_date_tr(start_date),
+        format_date_tr(end_date),
         escape_html(&settings.location),
         jobs.len()
     )
@@ -406,23 +379,6 @@ fn normalize_url(value: &str) -> String {
         .unwrap_or(value)
         .trim_end_matches('/')
         .to_string()
-}
-
-fn strip_html(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut in_tag = false;
-    for ch in value.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                out.push(' ');
-            }
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn escape_html(value: &str) -> String {
