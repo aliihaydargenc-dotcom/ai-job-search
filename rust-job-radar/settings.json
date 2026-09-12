@@ -1,6 +1,7 @@
 {
-  "min_score": 69,
-  "max_email_jobs": 15,
+  "location": "Antalya",
+  "radius": "0",
+  "result_on_page": 100,
   "roles": [
     "data analyst",
     "veri analisti",
@@ -25,17 +26,6 @@
     "data analysis",
     "veri analizi"
   ],
-  "locations": [
-    "antalya",
-    "türkiye",
-    "turkey",
-    "remote",
-    "hybrid",
-    "worldwide",
-    "anywhere",
-    "europe",
-    "emea"
-  ],
   "penalty_terms": [
     "senior",
     "lead",
@@ -46,7 +36,14 @@
   ],
   "jooble_queries": [
     "data analyst",
+    "veri analisti",
+    "bi analyst",
     "business intelligence",
-    "reporting analyst"
+    "reporting analyst",
+    "reporting specialist",
+    "raporlama uzmanı",
+    "sql analyst",
+    "data reporting",
+    "revenue analyst"
   ]
 }
