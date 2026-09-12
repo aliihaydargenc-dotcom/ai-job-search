@@ -2,11 +2,6 @@ name: Rust Job Radar - Daily
 
 on:
   workflow_dispatch:
-  push:
-    branches: [master]
-    paths:
-      - "rust-job-radar/**"
-      - ".github/workflows/rust-job-radar-daily.yml"
   schedule:
     - cron: "30 9 * * *"
       timezone: "Europe/Istanbul"
