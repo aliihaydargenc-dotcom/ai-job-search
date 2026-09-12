@@ -1,0 +1,4 @@
+/target
+.env
+data/seen_jobs.json
+.DS_Store
