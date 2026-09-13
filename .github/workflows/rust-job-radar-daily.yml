@@ -3,7 +3,7 @@ name: Rust Job Radar - Daily
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 9 * * *"
+    - cron: "31 9 * * *"
       timezone: "Europe/Istanbul"
 
 permissions:
